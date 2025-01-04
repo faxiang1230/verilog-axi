@@ -42,7 +42,9 @@ module axi_ram #
     // Width of ID signal
     parameter ID_WIDTH = 8,
     // Extra pipeline register on output
-    parameter PIPELINE_OUTPUT = 0
+    parameter PIPELINE_OUTPUT = 0,
+    // Extra init file
+    parameter INIT_FILE = ""
 )
 (
     input  wire                   clk,
@@ -88,6 +90,7 @@ module axi_ram #
 parameter VALID_ADDR_WIDTH = ADDR_WIDTH - $clog2(STRB_WIDTH);
 parameter WORD_WIDTH = STRB_WIDTH;
 parameter WORD_SIZE = DATA_WIDTH/WORD_WIDTH;
+localparam BUS_ADDR_WIDTH = $clog2(STRB_WIDTH);
 
 // bus width assertions
 initial begin
@@ -113,6 +116,11 @@ localparam [1:0]
     WRITE_STATE_BURST = 2'd1,
     WRITE_STATE_RESP = 2'd2;
 
+localparam [1:0]
+	BURST_FIX  = 2'b00,
+	BURST_INCR = 2'b01,
+	BURST_WRAP = 2'b10;
+
 reg [1:0] write_state_reg = WRITE_STATE_IDLE, write_state_next;
 
 reg mem_wr_en;
@@ -123,11 +131,38 @@ reg [ADDR_WIDTH-1:0] read_addr_reg = {ADDR_WIDTH{1'b0}}, read_addr_next;
 reg [7:0] read_count_reg = 8'd0, read_count_next;
 reg [2:0] read_size_reg = 3'd0, read_size_next;
 reg [1:0] read_burst_reg = 2'd0, read_burst_next;
+
+reg [ADDR_WIDTH-1:12] read_wrap_high_addr_reg = {(ADDR_WIDTH-12){1'b0}}, read_wrap_high_addr_next;
+reg [11:0] read_wrap_low_boundary_reg, read_wrap_low_boundary_next;
+reg [11:0] read_wrap_high_boundary_reg, read_wrap_high_boundary_next;
+
+reg [BUS_ADDR_WIDTH-1:0] read_wrap_low_addr_reg, read_wrap_low_addr_next;
+reg [BUS_ADDR_WIDTH-1:0] read_wrap_low_align_addr_reg, read_wrap_low_align_addr_next;
+reg [BUS_ADDR_WIDTH-1:0] read_wrap_low_addr_next_r1;
+
+reg [11:BUS_ADDR_WIDTH] read_wrap_mid_addr_reg, read_wrap_mid_addr_next;
+reg [11:BUS_ADDR_WIDTH] read_wrap_mid_addr_next_r1;
+reg [11:0] read_wrap_mid_low_addr_next_r1;
+reg read_wrap_low_addr_overflow, read_wrap_mid_addr_overflow;
+
 reg [ID_WIDTH-1:0] write_id_reg = {ID_WIDTH{1'b0}}, write_id_next;
 reg [ADDR_WIDTH-1:0] write_addr_reg = {ADDR_WIDTH{1'b0}}, write_addr_next;
 reg [7:0] write_count_reg = 8'd0, write_count_next;
 reg [2:0] write_size_reg = 3'd0, write_size_next;
 reg [1:0] write_burst_reg = 2'd0, write_burst_next;
+
+reg [ADDR_WIDTH-1:12] write_wrap_high_addr_reg = {(ADDR_WIDTH-12){1'b0}}, write_wrap_high_addr_next;
+reg [11:0] write_wrap_low_boundary_reg, write_wrap_low_boundary_next;
+reg [11:0] write_wrap_high_boundary_reg, write_wrap_high_boundary_next;
+
+reg [BUS_ADDR_WIDTH-1:0] write_wrap_low_addr_reg, write_wrap_low_addr_next;
+reg [BUS_ADDR_WIDTH-1:0] write_wrap_low_align_addr_reg, write_wrap_low_align_addr_next;
+reg [BUS_ADDR_WIDTH-1:0] write_wrap_low_addr_next_r1;
+
+reg [11:BUS_ADDR_WIDTH] write_wrap_mid_addr_reg, write_wrap_mid_addr_next;
+reg [11:BUS_ADDR_WIDTH] write_wrap_mid_addr_next_r1;
+reg [11:0] write_wrap_mid_low_addr_next_r1;
+reg write_wrap_low_addr_overflow, write_wrap_mid_addr_overflow;
 
 reg s_axi_awready_reg = 1'b0, s_axi_awready_next;
 reg s_axi_wready_reg = 1'b0, s_axi_wready_next;
@@ -173,6 +208,11 @@ initial begin
             mem[j] = 0;
         end
     end
+
+    if (INIT_FILE != "") begin
+       $readmemh(INIT_FILE, mem);
+    end
+
 end
 
 always @* begin
@@ -191,6 +231,16 @@ always @* begin
     s_axi_bid_next = s_axi_bid_reg;
     s_axi_bvalid_next = s_axi_bvalid_reg && !s_axi_bready;
 
+    write_wrap_high_addr_next = write_wrap_high_addr_reg;
+    write_wrap_mid_addr_next = write_wrap_mid_addr_reg;
+    write_wrap_low_addr_next = write_wrap_low_addr_reg;
+    write_wrap_low_align_addr_next = write_wrap_low_align_addr_reg;
+
+    write_wrap_low_boundary_next = write_wrap_low_boundary_reg;
+    write_wrap_high_boundary_next = write_wrap_high_boundary_reg;
+    write_wrap_low_addr_overflow = 1'b0;
+    write_wrap_mid_addr_overflow = 1'b0;
+
     case (write_state_reg)
         WRITE_STATE_IDLE: begin
             s_axi_awready_next = 1'b1;
@@ -201,6 +251,15 @@ always @* begin
                 write_count_next = s_axi_awlen;
                 write_size_next = s_axi_awsize < $clog2(STRB_WIDTH) ? s_axi_awsize : $clog2(STRB_WIDTH);
                 write_burst_next = s_axi_awburst;
+
+                write_wrap_high_addr_next = s_axi_awaddr[ADDR_WIDTH-1:12];
+                write_wrap_mid_addr_next = s_axi_awaddr[11:BUS_ADDR_WIDTH];
+                write_wrap_low_addr_next = s_axi_awaddr[BUS_ADDR_WIDTH-1:0];
+
+                write_wrap_low_align_addr_next = s_axi_awaddr[BUS_ADDR_WIDTH-1:0] &
+                    ({BUS_ADDR_WIDTH{1'b1}} & ~((1 << write_size_next) - 1));
+                write_wrap_low_boundary_next = s_axi_awaddr[11:0] & ~(((s_axi_awlen[3:0] + 1) << write_size_next) - 1);
+                write_wrap_high_boundary_next = write_wrap_low_boundary_next + ((s_axi_awlen[3:0] + 1) << write_size_next);
 
                 s_axi_awready_next = 1'b0;
                 s_axi_wready_next = 1'b1;
@@ -214,8 +273,21 @@ always @* begin
 
             if (s_axi_wready && s_axi_wvalid) begin
                 mem_wr_en = 1'b1;
-                if (write_burst_reg != 2'b00) begin
+                if (write_burst_reg == BURST_INCR) begin
                     write_addr_next = write_addr_reg + (1 << write_size_reg);
+				end else if (write_burst_reg == BURST_WRAP) begin
+                    {write_wrap_low_addr_overflow, write_wrap_low_addr_next_r1} = write_wrap_low_align_addr_reg + (1 << write_size_reg);
+                    {write_wrap_mid_addr_overflow, write_wrap_mid_addr_next_r1} = write_wrap_mid_addr_reg + 1;
+
+                    write_wrap_mid_low_addr_next_r1 = write_wrap_low_addr_overflow ?
+                        {write_wrap_mid_addr_next_r1, write_wrap_low_addr_next_r1}:
+                        {write_wrap_mid_addr_reg, write_wrap_low_addr_next_r1};
+
+                    write_addr_next = (write_wrap_mid_low_addr_next_r1 == write_wrap_high_boundary_reg) ?
+                        {write_wrap_high_addr_reg, write_wrap_low_boundary_reg} :
+                        {write_wrap_high_addr_reg, write_wrap_mid_low_addr_next_r1};
+
+                    write_wrap_low_align_addr_next = write_addr_next[BUS_ADDR_WIDTH-1:0];
                 end
                 write_count_next = write_count_reg - 1;
                 if (write_count_reg > 0) begin
@@ -262,6 +334,13 @@ always @(posedge clk) begin
     s_axi_bid_reg <= s_axi_bid_next;
     s_axi_bvalid_reg <= s_axi_bvalid_next;
 
+    write_wrap_high_addr_reg <= write_wrap_high_addr_next;
+    write_wrap_mid_addr_reg <= write_addr_next[11:BUS_ADDR_WIDTH];
+    write_wrap_low_addr_reg <= write_addr_next[BUS_ADDR_WIDTH-1:0];
+    write_wrap_low_align_addr_reg <= write_wrap_low_align_addr_next;
+    write_wrap_low_boundary_reg <= write_wrap_low_boundary_next;
+    write_wrap_high_boundary_reg <= write_wrap_high_boundary_next;
+
     for (i = 0; i < WORD_WIDTH; i = i + 1) begin
         if (mem_wr_en & s_axi_wstrb[i]) begin
             mem[write_addr_valid][WORD_SIZE*i +: WORD_SIZE] <= s_axi_wdata[WORD_SIZE*i +: WORD_SIZE];
@@ -292,11 +371,22 @@ always @* begin
     read_size_next = read_size_reg;
     read_burst_next = read_burst_reg;
 
+    read_wrap_high_addr_next = read_wrap_high_addr_reg;
+    read_wrap_mid_addr_next = read_wrap_mid_addr_reg;
+    read_wrap_low_addr_next = read_wrap_low_addr_reg;
+    read_wrap_low_align_addr_next = read_wrap_low_align_addr_reg;
+
+    read_wrap_low_boundary_next = read_wrap_low_boundary_reg;
+    read_wrap_high_boundary_next = read_wrap_high_boundary_reg;
+    read_wrap_low_addr_overflow = 1'b0;
+    read_wrap_mid_addr_overflow = 1'b0;
+
     s_axi_arready_next = 1'b0;
 
     case (read_state_reg)
         READ_STATE_IDLE: begin
             s_axi_arready_next = 1'b1;
+            s_axi_rlast_next = 1'b0;
 
             if (s_axi_arready && s_axi_arvalid) begin
                 read_id_next = s_axi_arid;
@@ -304,6 +394,15 @@ always @* begin
                 read_count_next = s_axi_arlen;
                 read_size_next = s_axi_arsize < $clog2(STRB_WIDTH) ? s_axi_arsize : $clog2(STRB_WIDTH);
                 read_burst_next = s_axi_arburst;
+
+                read_wrap_high_addr_next = s_axi_araddr[ADDR_WIDTH-1:12];
+                read_wrap_mid_addr_next = s_axi_araddr[11:BUS_ADDR_WIDTH];
+                read_wrap_low_addr_next = s_axi_araddr[BUS_ADDR_WIDTH-1:0];
+
+                read_wrap_low_align_addr_next = s_axi_araddr[BUS_ADDR_WIDTH-1:0] &
+                    ({BUS_ADDR_WIDTH{1'b1}} & ~((1 << read_size_next) - 1));
+                read_wrap_low_boundary_next = s_axi_araddr[11:0] & ~(((s_axi_arlen[3:0] + 1) << read_size_next) - 1);
+                read_wrap_high_boundary_next = read_wrap_low_boundary_next + ((s_axi_arlen[3:0] + 1) << read_size_next);
 
                 s_axi_arready_next = 1'b0;
                 read_state_next = READ_STATE_BURST;
@@ -317,8 +416,21 @@ always @* begin
                 s_axi_rvalid_next = 1'b1;
                 s_axi_rid_next = read_id_reg;
                 s_axi_rlast_next = read_count_reg == 0;
-                if (read_burst_reg != 2'b00) begin
+                if (read_burst_reg == BURST_INCR) begin
                     read_addr_next = read_addr_reg + (1 << read_size_reg);
+                end else if (read_burst_reg == BURST_WRAP) begin
+                    {read_wrap_low_addr_overflow, read_wrap_low_addr_next_r1} = read_wrap_low_align_addr_reg + (1 << read_size_reg);
+                    {read_wrap_mid_addr_overflow, read_wrap_mid_addr_next_r1} = read_wrap_mid_addr_reg + 1;
+
+                    read_wrap_mid_low_addr_next_r1 = read_wrap_low_addr_overflow ?
+                        {read_wrap_mid_addr_next_r1, read_wrap_low_addr_next_r1}:
+                        {read_wrap_mid_addr_reg, read_wrap_low_addr_next_r1};
+
+                    read_addr_next = (read_wrap_mid_low_addr_next_r1 == read_wrap_high_boundary_reg) ?
+                        {read_wrap_high_addr_reg, read_wrap_low_boundary_reg} :
+                        {read_wrap_high_addr_reg, read_wrap_mid_low_addr_next_r1};
+
+                    read_wrap_low_align_addr_next = read_addr_next[BUS_ADDR_WIDTH-1:0];
                 end
                 read_count_next = read_count_reg - 1;
                 if (read_count_reg > 0) begin
@@ -347,6 +459,13 @@ always @(posedge clk) begin
     s_axi_rid_reg <= s_axi_rid_next;
     s_axi_rlast_reg <= s_axi_rlast_next;
     s_axi_rvalid_reg <= s_axi_rvalid_next;
+
+    read_wrap_high_addr_reg <= read_wrap_high_addr_next;
+    read_wrap_mid_addr_reg <= read_addr_next[11:BUS_ADDR_WIDTH];
+    read_wrap_low_addr_reg <= read_addr_next[BUS_ADDR_WIDTH-1:0];
+    read_wrap_low_align_addr_reg <= read_wrap_low_align_addr_next;
+    read_wrap_low_boundary_reg <= read_wrap_low_boundary_next;
+    read_wrap_high_boundary_reg <= read_wrap_high_boundary_next;
 
     if (mem_rd_en) begin
         s_axi_rdata_reg <= mem[read_addr_valid];
